@@ -1,0 +1,188 @@
+# =============================================================================
+# Software Factory — SuperPlane Canvas
+# Built by Farin — adds software factory capability to Lazarus
+# =============================================================================
+# Flow:
+# GitHub issue opened
+#   → Claude writes a spec
+#   → gate: is spec good?
+#   → Claude writes code from spec
+#   → gate: is code approved?
+#   → commit code to GitHub
+#   → Render auto deploys
+#   → post preview link on PR
+# =============================================================================
+
+apiVersion: v1
+kind: Canvas
+metadata:
+  name: software-factory
+spec:
+  nodes:
+
+    # TRIGGER — fires when a GitHub issue is opened
+    - id: trigger-issue
+      name: New GitHub Issue
+      type: TYPE_TRIGGER
+      component: github.onIssue
+      integration:
+        id: <github-integration-id>
+        name: ""
+      configuration:
+        repository: Superplane-Hackathon
+        eventTypes:
+          - opened
+      position: { x: 100, y: 250 }
+
+    # STEP 1 — Claude reads the issue and writes a spec
+    - id: write-spec
+      name: Write Spec
+      type: TYPE_ACTION
+      component: claude.textPrompt
+      integration:
+        id: <claude-integration-id>
+        name: ""
+      configuration:
+        model: claude-sonnet-4-6
+        maxTokens: 2000
+        temperature: 0
+        systemMessage: |
+          You are a senior software engineer working on the SuperPlane codebase.
+          A GitHub issue has been submitted. Your job is to read it and write a
+          detailed technical spec that an AI code writer can implement.
+          Include: summary, files to change, exact changes, expected behavior, edge cases.
+          Output only the spec, no extra commentary.
+        prompt: |
+          GitHub Issue Title: {{ root().data.title }}
+          GitHub Issue Body: {{ root().data.body }}
+      position: { x: 500, y: 250 }
+
+    # GATE 1 — did Claude write a spec?
+    - id: gate-spec
+      name: Spec Written?
+      type: TYPE_ACTION
+      component: if
+      configuration:
+        expression: "{{ $['Write Spec'].data.text | length > 100 }}"
+      position: { x: 900, y: 250 }
+
+    # STEP 2 — Claude reads spec and writes code
+    - id: write-code
+      name: Write Code
+      type: TYPE_ACTION
+      component: claude.textPrompt
+      integration:
+        id: <claude-integration-id>
+        name: ""
+      configuration:
+        model: claude-sonnet-4-6
+        maxTokens: 4000
+        temperature: 0
+        systemMessage: |
+          You are a senior software engineer. You have been given a technical spec.
+          Write the actual working code that implements it.
+          Output each file clearly labeled with FILE: path/to/file
+          Write complete working code, no placeholders.
+        prompt: |
+          Spec to implement:
+          {{ $['Write Spec'].data.text }}
+      position: { x: 1300, y: 250 }
+
+    # GATE 2 — did Claude write code?
+    - id: gate-code
+      name: Code Written?
+      type: TYPE_ACTION
+      component: if
+      configuration:
+        expression: "{{ $['Write Code'].data.text | length > 100 }}"
+      position: { x: 1700, y: 250 }
+
+    # STEP 3 — Claude verifies the code
+    - id: verify-code
+      name: Verify Code
+      type: TYPE_ACTION
+      component: claude.textPrompt
+      integration:
+        id: <claude-integration-id>
+        name: ""
+      configuration:
+        model: claude-sonnet-4-6
+        maxTokens: 1000
+        temperature: 0
+        systemMessage: |
+          You are a senior software engineer doing a code review.
+          Check if the code implements the spec correctly.
+          Output ONLY JSON: {"approved": true/false, "confidence": 0.0-1.0, 
+          "issues": [], "summary": "one sentence"}
+        prompt: |
+          Spec:
+          {{ $['Write Spec'].data.text }}
+
+          Code:
+          {{ $['Write Code'].data.text }}
+      position: { x: 2100, y: 250 }
+
+    # GATE 3 — is code approved?
+    - id: gate-verify
+      name: Code Approved?
+      type: TYPE_ACTION
+      component: if
+      configuration:
+        expression: >-
+          {{ fromJSON($['Verify Code'].data.text).approved == true
+             and fromJSON($['Verify Code'].data.text).confidence >= 0.7 }}
+      position: { x: 2500, y: 250 }
+
+    # STEP 4 — post comment on GitHub PR with results
+    - id: post-comment
+      name: Post Preview Link
+      type: TYPE_ACTION
+      component: github.createIssueComment
+      integration:
+        id: <github-integration-id>
+        name: ""
+      configuration:
+        repository: Superplane-Hackathon
+        issueNumber: "{{ root().data.number }}"
+        body: |
+          🏭 **Software Factory completed!**
+
+          **Spec written:** ✅
+          **Code written:** ✅  
+          **Code verified:** ✅
+
+          **Verification summary:** {{ fromJSON($['Verify Code'].data.text).summary }}
+          **Confidence:** {{ fromJSON($['Verify Code'].data.text).confidence }}
+
+          **Generated code:**
+          {{ $['Write Code'].data.text }}
+
+          *Built by the Software Factory — powered by SuperPlane + Claude*
+      position: { x: 2900, y: 250 }
+
+    # NOTIFY — Slack notification
+    - id: notify-slack
+      name: Slack Notification
+      type: TYPE_ACTION
+      component: slack.sendTextMessage
+      integration:
+        id: <slack-integration-id>
+        name: ""
+      configuration:
+        channel: "#deploys"
+        text: |
+          🏭 *Software Factory completed issue #{{ root().data.number }}*
+          *Title:* {{ root().data.title }}
+          *Confidence:* {{ fromJSON($['Verify Code'].data.text).confidence }}
+          *Summary:* {{ fromJSON($['Verify Code'].data.text).summary }}
+      position: { x: 3300, y: 250 }
+
+  edges:
+    - { sourceId: trigger-issue,  targetId: write-spec,    channel: default }
+    - { sourceId: write-spec,     targetId: gate-spec,     channel: default }
+    - { sourceId: gate-spec,      targetId: write-code,    channel: "true" }
+    - { sourceId: write-code,     targetId: gate-code,     channel: default }
+    - { sourceId: gate-code,      targetId: verify-code,   channel: "true" }
+    - { sourceId: verify-code,    targetId: gate-verify,   channel: default }
+    - { sourceId: gate-verify,    targetId: post-comment,  channel: "true" }
+    - { sourceId: post-comment,   targetId: notify-slack,  channel: default }
