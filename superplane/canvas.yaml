@@ -1,0 +1,342 @@
+# =============================================================================
+# Lazarus — self-healing deploy agent  ·  SuperPlane Canvas
+# =============================================================================
+# Apply with:
+#   superplane apps create --canvas-file canvas.yaml
+#   # then verify:
+#   superplane apps canvas get lazarus -o yaml   # check every node has empty
+#                                                # errorMessage / warningMessage
+#
+# GROUND-TRUTH NOTE (read before trusting this file):
+# The Canvas envelope (apiVersion/kind/metadata/spec), node fields, edge fields,
+# built-in components (if/filter/merge/noop/http/readMemory/upsertMemory) and the
+# component IDs (render.onDeploy, render.getDeploy, render.rollbackDeploy,
+# claude.textPrompt, github.createIssue, slack.sendTextMessage) are VERIFIED from
+# superplanehq/skills + docs.superplane.com.
+#
+# What is NOT verified and is marked `# ASSUMPTION — verify` below:
+#   1. The exact `configuration:` KEY spellings for integration components
+#      (service / deployId / model / systemMessage / channel / text / repository).
+#      Confirm with:  superplane index actions --name <id> --output json
+#   2. Output channel literals for integration actions (success/failed).
+#   3. Upstream payload field paths (.data.status, .data.statusCode, .data.body,
+#      readMemory's .data.lastGoodDeployId). Confirm from a real execution:
+#      superplane executions list --app-id <id> --node-id <nid> -o yaml
+#   4. Whether Expr exposes `fromJSON(...)` to parse Claude's JSON text in an `if`.
+#      If not, add a small `http`/transform node to parse, or have the Claude
+#      step emit individual fields. See canvas.md "Open questions".
+# Integration IDs are placeholders: replace <render-integration-id> /
+# <github-integration-id> / <slack-integration-id> with values from
+# `superplane integrations list`.
+# =============================================================================
+apiVersion: v1
+kind: Canvas
+metadata:
+  # id: <assigned-on-create>   # required only for `canvas update`
+  name: lazarus
+spec:
+  nodes:
+    # ----- TRIGGERS ---------------------------------------------------------
+    - id: trigger-ondeploy
+      name: Render onDeploy
+      type: TYPE_TRIGGER
+      component: render.onDeploy
+      integration:
+        id: <render-integration-id>
+        name: ""
+      configuration:
+        service: lazarus-web          # ASSUMPTION — verify key name + value form (id vs name)
+        eventTypes:                   # ASSUMPTION — verify; defaults to deploy_ended
+          - deploy_ended
+      position: { x: 120, y: 250 }
+      paused: false
+      isCollapsed: false
+
+    # Manual-run fallback so the Canvas can be demoed without a live webhook.
+    # Payload mirrors sample-event-ondeploy.json (.data fields hoisted to top
+    # level so root().data.deployId resolves the same way for both triggers).
+    - id: trigger-manual
+      name: Manual Run
+      type: TYPE_TRIGGER
+      component: start
+      configuration:
+        templates:
+          - name: broken-deploy
+            payload:
+              eventId: evt-7f3a91c2
+              deployId: dep-d1f7c9aa
+              serviceId: srv-lazaruswebxxxxxxxxx
+              serviceName: lazarus-web
+              status: update_failed
+              createdAt: "2026-06-27T15:42:08Z"
+            parameters: []
+      position: { x: 120, y: 700 }
+      paused: false
+      isCollapsed: false
+
+    # ----- PARALLEL CONTEXT GATHER -----------------------------------------
+    - id: get-deploy
+      name: Get Deploy
+      type: TYPE_ACTION
+      component: render.getDeploy
+      integration:
+        id: <render-integration-id>
+        name: ""
+      configuration:
+        service: lazarus-web                    # ASSUMPTION — verify key
+        deployId: "{{ root().data.deployId }}"  # ASSUMPTION — verify path
+      position: { x: 720, y: 100 }
+      paused: false
+      isCollapsed: false
+
+    - id: check-health
+      name: Check Health
+      type: TYPE_ACTION
+      component: http
+      configuration:
+        method: GET
+        # Replace with your live lazarus-web URL.
+        url: "https://lazarus-web.onrender.com/health"
+      position: { x: 720, y: 400 }
+      paused: false
+      isCollapsed: false
+
+    # `http` splits to success(2xx)/failure(non-2xx). A 500 /health is the
+    # interesting case, so funnel BOTH channels through one pass-through node
+    # to give Merge a single, always-firing input. (See canvas.md.)
+    - id: health-result
+      name: Health Result
+      type: TYPE_ACTION
+      component: noop
+      configuration: {}
+      position: { x: 1320, y: 400 }
+      paused: false
+      isCollapsed: false
+
+    - id: merge-context
+      name: Merge Context
+      type: TYPE_ACTION
+      component: merge
+      configuration: {}
+      position: { x: 1920, y: 250 }
+      paused: false
+      isCollapsed: false
+
+    # ----- DECISION: is this deploy failed or unhealthy? --------------------
+    - id: gate
+      name: Failed or Unhealthy?
+      type: TYPE_ACTION
+      component: if
+      configuration:
+        # deploy reached a failure status OR /health did not return 200.
+        # ASSUMPTION — verify status enum values and .data.statusCode path.
+        expression: >-
+          {{ $['Get Deploy'].data.status in ["update_failed","build_failed","failed","canceled","deactivated"]
+             or $['Check Health'].data.statusCode != 200 }}
+      position: { x: 2520, y: 250 }
+      paused: false
+      isCollapsed: false
+
+    # Healthy deploy -> remember it as last-known-good (Memory).
+    - id: store-lastgood
+      name: Remember Good Deploy
+      type: TYPE_ACTION
+      component: upsertMemory
+      configuration:
+        namespace: lazarus
+        matchList:
+          - name: service
+            value: lazarus-web
+        valueList:
+          - name: lastGoodDeployId
+            value: "{{ root().data.deployId }}"   # ASSUMPTION — verify path
+      position: { x: 3120, y: 550 }
+      paused: false
+      isCollapsed: false
+
+    # Unhealthy deploy -> fetch the last-known-good id we can roll back to.
+    - id: read-lastgood
+      name: Read Last-Good
+      type: TYPE_ACTION
+      component: readMemory
+      configuration:
+        namespace: lazarus
+        matchList:
+          - name: service
+            value: lazarus-web
+        resultMode: latest
+      position: { x: 3120, y: 100 }
+      paused: false
+      isCollapsed: false
+
+    # ----- THE AGENT: diagnose + recommend (strict JSON) --------------------
+    - id: analyze
+      name: Analyze Failure
+      type: TYPE_ACTION
+      component: claude.textPrompt
+      integration:
+        id: <claude-integration-id>
+        name: ""
+      configuration:
+        model: claude-opus-4-8        # ASSUMPTION — verify config key (model)
+        maxTokens: 1024               # ASSUMPTION — verify key (maxTokens)
+        temperature: 0
+        # Full text lives in agent/analysis_prompt.md — keep them in sync.
+        systemMessage: |-             # ASSUMPTION — verify key (systemMessage)
+          You are Lazarus, an autonomous SRE agent in a SuperPlane deploy pipeline.
+          A deploy of "lazarus-web" on Render failed or is reporting an unhealthy
+          /health endpoint. Decide, WITHOUT a human, what to do next.
+          Choose exactly one recommended_action:
+            - "rollback"   : a last-known-good deploy exists AND this deploy clearly
+                             caused the failure (bad config, boot crash, forced
+                             unhealthy, broken build). Safe to auto-roll-back.
+            - "open_issue" : needs a human/code change a rollback won't fix.
+            - "page"       : ambiguous / low-confidence / risk -> get a human now.
+          Rules: confidence in [0,1]; use >= 0.7 ONLY when logs clearly support the
+          cause AND a last-known-good id exists. If no last-known-good id is given,
+          you may NOT recommend "rollback". root_cause = one tight sentence.
+          Output ONLY one JSON object, no code fences, exactly:
+          {"root_cause": string, "confidence": number, "recommended_action": "rollback" | "open_issue" | "page", "explanation": string}
+        prompt: |-                     # ASSUMPTION — verify key (prompt)
+          Service: lazarus-web
+          Render deploy status: {{ $['Get Deploy'].data.status }}
+          Failed deploy id: {{ root().data.deployId }}
+          Last-known-good deploy id: {{ $['Read Last-Good'].data.lastGoodDeployId }}
+
+          --- /health response (HTTP {{ $['Check Health'].data.statusCode }}) ---
+          {{ $['Check Health'].data.body }}
+
+          --- deploy / build logs ---
+          {{ $['Get Deploy'].data.logs }}
+      position: { x: 3720, y: 100 }
+      paused: false
+      isCollapsed: false
+
+    # ----- DECISION: autonomously roll back, or escalate? -------------------
+    - id: decide
+      name: Rollback or Escalate?
+      type: TYPE_ACTION
+      component: if
+      configuration:
+        # ASSUMPTION — verify Expr has fromJSON(); else parse upstream.
+        expression: >-
+          {{ fromJSON($['Analyze Failure'].data.text).confidence >= 0.7
+             and fromJSON($['Analyze Failure'].data.text).recommended_action == "rollback" }}
+      position: { x: 4320, y: 100 }
+      paused: false
+      isCollapsed: false
+
+    # ----- ACT: rollback path ----------------------------------------------
+    - id: rollback
+      name: Rollback Deploy
+      type: TYPE_ACTION
+      component: render.rollbackDeploy
+      integration:
+        id: <render-integration-id>
+        name: ""
+      configuration:
+        service: lazarus-web                                       # ASSUMPTION — verify key
+        deployId: "{{ $['Read Last-Good'].data.lastGoodDeployId }}" # ASSUMPTION — verify path
+      position: { x: 4920, y: 100 }
+      paused: false
+      isCollapsed: false
+
+    - id: notify-rollback
+      name: "Slack: Rolled Back"
+      type: TYPE_ACTION
+      component: slack.sendTextMessage
+      integration:
+        id: <slack-integration-id>
+        name: ""
+      configuration:
+        channel: "#deploys"            # ASSUMPTION — verify key + channel id form
+        text: |-                       # ASSUMPTION — verify key (text)
+          :recycle: *Lazarus auto-healed lazarus-web*
+          *Root cause:* {{ fromJSON($['Analyze Failure'].data.text).root_cause }}
+          *Confidence:* {{ fromJSON($['Analyze Failure'].data.text).confidence }}
+          *Action taken:* rolled back to last-known-good `{{ $['Read Last-Good'].data.lastGoodDeployId }}`
+          *Reasoning:* {{ fromJSON($['Analyze Failure'].data.text).explanation }}
+          *Audit trail:* <{{ root().data.runUrl }}|view this run in SuperPlane>
+      position: { x: 5520, y: 100 }
+      paused: false
+      isCollapsed: false
+
+    # ----- ACT: escalate path (open issue + page) --------------------------
+    - id: create-issue
+      name: Open GitHub Issue
+      type: TYPE_ACTION
+      component: github.createIssue
+      integration:
+        id: <github-integration-id>
+        name: ""
+      configuration:
+        repository: lazarus            # ASSUMPTION — verify: resource name, not owner/repo
+        title: "[Lazarus] lazarus-web deploy {{ root().data.deployId }} unhealthy"
+        body: |-
+          Lazarus could not safely auto-roll-back this deploy.
+
+          **Root cause:** {{ fromJSON($['Analyze Failure'].data.text).root_cause }}
+          **Confidence:** {{ fromJSON($['Analyze Failure'].data.text).confidence }}
+          **Recommended action:** {{ fromJSON($['Analyze Failure'].data.text).recommended_action }}
+          **Reasoning:** {{ fromJSON($['Analyze Failure'].data.text).explanation }}
+
+          **Deploy id:** {{ root().data.deployId }}
+          **/health (HTTP {{ $['Check Health'].data.statusCode }}):**
+          ```
+          {{ $['Check Health'].data.body }}
+          ```
+      position: { x: 4920, y: 400 }
+      paused: false
+      isCollapsed: false
+
+    - id: page-oncall
+      name: "Slack: Page On-Call"
+      type: TYPE_ACTION
+      component: slack.sendTextMessage
+      integration:
+        id: <slack-integration-id>
+        name: ""
+      configuration:
+        channel: "#incidents"          # ASSUMPTION — verify key + channel id form
+        text: |-
+          :rotating_light: *Lazarus needs a human on lazarus-web*
+          *Root cause:* {{ fromJSON($['Analyze Failure'].data.text).root_cause }}
+          *Confidence:* {{ fromJSON($['Analyze Failure'].data.text).confidence }} (below auto-rollback threshold)
+          *Action:* opened a GitHub issue with the evidence pack.
+          *Audit trail:* <{{ root().data.runUrl }}|view this run in SuperPlane>
+      position: { x: 5520, y: 400 }
+      paused: false
+      isCollapsed: false
+
+  edges:
+    # both triggers feed the same parallel context gather
+    - { sourceId: trigger-ondeploy, targetId: get-deploy,   channel: default }
+    - { sourceId: trigger-ondeploy, targetId: check-health, channel: default }
+    - { sourceId: trigger-manual,   targetId: get-deploy,   channel: default }
+    - { sourceId: trigger-manual,   targetId: check-health, channel: default }
+
+    # normalize http's two channels into one input for Merge
+    - { sourceId: check-health, targetId: health-result, channel: success }   # ASSUMPTION — verify channel
+    - { sourceId: check-health, targetId: health-result, channel: failure }   # ASSUMPTION — verify channel
+
+    # fan-in
+    - { sourceId: get-deploy,    targetId: merge-context, channel: default }
+    - { sourceId: health-result, targetId: merge-context, channel: default }
+    - { sourceId: merge-context, targetId: gate,          channel: success }  # ASSUMPTION — verify merge channel
+
+    # healthy vs unhealthy
+    - { sourceId: gate, targetId: store-lastgood, channel: "false" }
+    - { sourceId: gate, targetId: read-lastgood,  channel: "true" }
+
+    # have a last-good -> analyze; none -> can't roll back, go straight to escalate
+    - { sourceId: read-lastgood, targetId: analyze,      channel: found }
+    - { sourceId: read-lastgood, targetId: create-issue, channel: notFound }
+
+    # agent verdict -> autonomous decision
+    - { sourceId: analyze, targetId: decide, channel: default }   # ASSUMPTION — verify claude channel
+    - { sourceId: decide,  targetId: rollback,     channel: "true" }
+    - { sourceId: decide,  targetId: create-issue, channel: "false" }
+
+    # notifications / audit trail
+    - { sourceId: rollback,     targetId: notify-rollback, channel: success }  # ASSUMPTION — verify channel
+    - { sourceId: create-issue, targetId: page-oncall,     channel: default }

@@ -1,0 +1,59 @@
+# Render Blueprint for Lazarus — defines BOTH required Render services.
+# Render track requires >= 2 services; this blueprint stands up exactly that:
+#   1. lazarus-web    — public Express web service (the "production" app)
+#   2. lazarus-worker — background worker that heartbeats lazarus-web
+#
+# Deploy: push this repo to GitHub, then in Render -> New -> Blueprint, point at
+# this file. Both services come up from one commit.
+#
+# NOTE: use the Starter plan (not free) for the demo so there is no cold start.
+# See the "Render risk note" in DEMO.md.
+
+services:
+  # ----- Render service #1: the production web app ------------------------
+  - type: web
+    name: lazarus-web
+    runtime: node
+    plan: starter
+    rootDir: web
+    buildCommand: npm install
+    startCommand: npm start
+    # We intentionally DO NOT set healthCheckPath. Lazarus itself is the smart
+    # health check — it reasons about *why* /health is failing instead of just
+    # restarting. (Setting it would make Render hide a BREAK_MODE deploy before
+    # the Canvas can see it.) See README "Why no healthCheckPath".
+    autoDeploy: true
+    envVars:
+      # REQUIRED secret. Marked sync:false so Render prompts for it (and so
+      # deleting it is a realistic prod incident -> hard boot crash).
+      - key: CRITICAL_CONFIG
+        sync: false
+      # Failure-injection toggle (primary demo path). break.sh / heal.sh flip it.
+      - key: BREAK_MODE
+        value: "false"
+      # Worker heartbeat staleness threshold.
+      - key: WORKER_TIMEOUT_MS
+        value: "30000"
+
+  # ----- Render service #2: the background worker -------------------------
+  - type: worker
+    name: lazarus-worker
+    runtime: node
+    plan: starter
+    rootDir: worker
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      # Private-network address of lazarus-web (Render injects "host:port";
+      # the worker prepends http:// itself).
+      - key: WEB_INTERNAL_URL
+        fromService:
+          name: lazarus-web
+          type: web
+          property: hostport
+      - key: HEARTBEAT_INTERVAL_MS
+        value: "10000"
+      # Secondary failure-injection toggle (kill the worker, web goes unhealthy).
+      - key: WORKER_BREAK_MODE
+        value: "false"

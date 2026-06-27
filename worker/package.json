@@ -1,0 +1,13 @@
+{
+  "name": "lazarus-worker",
+  "version": "1.4.2",
+  "private": true,
+  "description": "Lazarus demo background worker — heartbeats to lazarus-web (Render service #2)",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

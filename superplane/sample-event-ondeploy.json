@@ -1,0 +1,14 @@
+{
+  "_comment": "Saved render.onDeploy event for the Lazarus Canvas. Use this as the payload for a Manual Run (component: start) so the Canvas can be demoed without a live Render webhook. The outer object is the SuperPlane envelope; the real Render fields live under .data — so expressions use root().data.deployId etc.",
+  "_comment_assumption": "// ASSUMPTION — verify against docs: field names (deployId, serviceId, status) are confirmed in docs.superplane.com/components/render, but the exact `status` string for a failed/unhealthy deploy is a best guess. Confirm with `superplane index triggers --name render.onDeploy --output json` and a real webhook payload, then adjust the gate expression in canvas.yaml.",
+  "data": {
+    "eventId": "evt-7f3a91c2",
+    "deployId": "dep-d1f7c9aa",
+    "serviceId": "srv-lazaruswebxxxxxxxxx",
+    "serviceName": "lazarus-web",
+    "status": "update_failed",
+    "createdAt": "2026-06-27T15:42:08Z"
+  },
+  "timestamp": "2026-06-27T15:42:09Z",
+  "type": "render.deploy"
+}
