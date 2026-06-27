@@ -9,6 +9,13 @@
 # NOTE: use the Starter plan (not free) for the demo so there is no cold start.
 # See the "Render risk note" in DEMO.md.
 
+# Software Factory: auto-create a PREVIEW environment for every pull request.
+# Each preview spins up BOTH services below (lazarus-web + lazarus-worker), which
+# is also what keeps us on the 2+ Render-services bonus track. Render posts the
+# preview URL as a comment on the PR. (Requires previews enabled on the Blueprint.)
+previews:
+  generation: automatic
+
 services:
   # ----- Render service #1: the production web app ------------------------
   - type: web

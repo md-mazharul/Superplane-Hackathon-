@@ -1,0 +1,149 @@
+# =============================================================================
+# Software Factory — code-gen engine (the step SuperPlane delegates to)
+# =============================================================================
+# SuperPlane's "GitHub: run code-gen workflow" node dispatches this with the
+# issue number, title, and the Claude-written spec. This workflow runs our OWN
+# generator (factory/generate.mjs) to write the code, then validates each stage,
+# commits, opens a PR, and lets Render build a PREVIEW environment.
+#
+# Why an owned script instead of a third-party action: it's deterministic, has no
+# dependencies, and we control the prompt + path safety. (anthropics/claude-code-action
+# remains a valid alternative — see the commented block at the bottom.)
+#
+# Secrets required (repo Settings -> Secrets and variables -> Actions):
+#   ANTHROPIC_API_KEY   - the Claude key from the hackathon
+#   (GITHUB_TOKEN is provided automatically)
+#
+# Render preview: render.yaml has `previews: generation: automatic`, so every PR
+# this opens spins up lazarus-web + lazarus-worker and Render comments the preview
+# URL on the PR. This job also comments the PR link back on the issue.
+#
+# NOTE on safety: issue text / spec are passed via ENV VARS (never interpolated
+# into shell or the prompt string), so a malicious issue can't inject commands.
+# =============================================================================
+name: software-factory
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number that triggered the build"
+        required: true
+      issue_title:
+        description: "Issue title"
+        required: false
+        default: "feature"
+      spec:
+        description: "Claude-written implementation spec (Markdown)"
+        required: true
+
+permissions:
+  contents: write        # push the branch
+  pull-requests: write   # open the PR
+  issues: write          # comment back on the issue
+
+concurrency:
+  group: factory-issue-${{ github.event.inputs.issue_number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Create feature branch
+        id: branch
+        run: |
+          BRANCH="factory/issue-${{ github.event.inputs.issue_number }}"
+          git config user.name  "software-factory[bot]"
+          git config user.email "factory@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      # ----- AGENT 2: Claude writes the actual code (our owned generator) -----
+      - name: Generate code with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+          ISSUE_TITLE: ${{ github.event.inputs.issue_title }}
+          SPEC: ${{ github.event.inputs.spec }}
+          # ANTHROPIC_MODEL: claude-opus-4-8   # uncomment for max quality (slower)
+        run: node factory/generate.mjs
+
+      # ----- GATE 2: did code actually get written? --------------------------
+      - name: Validate code was written
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "::error::No file changes were produced by the generator." >&2
+            exit 1
+          fi
+
+      # ----- GATE 2b: does the app still install/load? -----------------------
+      - name: Validate the app builds
+        working-directory: web
+        run: |
+          npm install
+          node -e "require('./server.js'); console.log('web/server.js loads OK')"
+
+      - name: Commit & push
+        env:
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+          ISSUE_TITLE: ${{ github.event.inputs.issue_title }}
+        run: |
+          git add -A
+          git commit -m "factory: implement issue #${ISSUE_NUMBER} — ${ISSUE_TITLE}"
+          git push origin "${{ steps.branch.outputs.branch }}"
+
+      # ----- Open the PR (this is what triggers the Render preview env) -------
+      - name: Open pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+          ISSUE_TITLE: ${{ github.event.inputs.issue_title }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          PR_URL=$(gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "Factory: #${ISSUE_NUMBER} ${ISSUE_TITLE}" \
+            --body "Automated by the Software Factory. Closes #${ISSUE_NUMBER}.
+
+          Spec and code written by Claude. Render is provisioning a preview environment for this PR; the preview URL will appear in a Render comment below.")
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      # ----- Post the PR link back on the originating issue -------------------
+      - name: Comment PR link on the issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --body "✅ **Software Factory built this.**
+          PR: ${PR_URL}
+          A Render **preview environment** (lazarus-web + lazarus-worker) is spinning up for the PR — the live preview URL is posted as a Render comment on the PR. No human wrote any code."
+
+# =============================================================================
+# ALTERNATIVE (instead of the "Generate code with Claude" step above): use the
+# official action. Trade-off: less control, but it can do multi-file refactors.
+#
+#   - name: Claude writes the code
+#     uses: anthropics/claude-code-action@beta
+#     with:
+#       anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+#       prompt: |
+#         Read the spec below and implement it in web/ with the smallest correct
+#         change. Do not touch worker/, render.yaml, scripts/, or superplane/.
+#         SPEC:
+#         ${{ github.event.inputs.spec }}
+#       claude_args: "--max-turns 20"
+# =============================================================================

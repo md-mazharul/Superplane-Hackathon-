@@ -1,0 +1,224 @@
+# =============================================================================
+# Software Factory — issue → spec → code → preview → PR comment  ·  SuperPlane Canvas
+# =============================================================================
+# Apply with:
+#   superplane apps create --canvas-file factory/canvas.yaml
+#   # then verify every node has empty errorMessage / warningMessage:
+#   superplane apps canvas get software-factory -o yaml
+#
+# WHAT THIS CANVAS DOES
+#   A GitHub issue is opened -> Claude writes a detailed spec -> a gate checks the
+#   spec actually exists -> Claude code-gen is delegated to a GitHub Actions
+#   workflow (.github/workflows/factory.yml) which writes the code, opens a PR,
+#   deploys a Render PREVIEW environment, and comments the live URL on the PR.
+#   This canvas posts the spec on the issue and announces start/finish in Slack.
+#
+# WHY GITHUB ACTIONS DOES THE CODE STEP
+#   SuperPlane's GitHub component can create issues / PR comments / pull requests
+#   but has NO "write file / commit" action. So the actual code writing + commit
+#   + Render preview is done by a workflow (anthropics/claude-code-action). The
+#   canvas stays the orchestrator + the validation gates + the speccing/verifying
+#   AI. This is the most reliable path for a 3-minute live demo.
+#
+# GROUND-TRUTH NOTE (SuperPlane is beta — verify before the live run):
+#   The envelope (apiVersion/kind/metadata/spec), node/edge fields, and the
+#   built-ins (if / noop / start) follow the verified pattern in
+#   superplane/canvas.yaml (Lazarus). What is NOT verified is marked
+#   `# ASSUMPTION — verify` and listed in factory/canvas.md "Open questions":
+#     1. configuration KEY spellings for integration components
+#        (repository / issueNumber / body / workflow / ref / inputs / model /
+#        prompt / systemMessage / channel / text). Confirm with:
+#          superplane index actions  --name github.createIssueComment --output json
+#          superplane index actions  --name github.runWorkflow         --output json
+#          superplane index actions  --name claude.textPrompt          --output json
+#          superplane index triggers --name github.onIssue             --output json
+#     2. Output-channel literals (success/failed, true/false).
+#     3. Upstream payload paths (.data.issue.number/.title/.body, .data.text).
+#     4. Whether the If field wants the expression with or without {{ }} (the
+#        Quickstart shows no braces; Lazarus uses braces). Match what the UI
+#        autocompletes.
+#   Integration IDs are placeholders: replace <github-integration-id> /
+#   <claude-integration-id> / <slack-integration-id> with values from
+#   `superplane integrations list`.
+# =============================================================================
+apiVersion: v1
+kind: Canvas
+metadata:
+  name: software-factory
+spec:
+  nodes:
+    # ----- TRIGGER: a GitHub issue is opened --------------------------------
+    - id: trigger-onissue
+      name: On GitHub Issue
+      type: TYPE_TRIGGER
+      component: github.onIssue
+      integration:
+        id: <github-integration-id>
+        name: ""
+      configuration:
+        repository: Superplane-Hackathon-   # ASSUMPTION — verify: resource name vs owner/repo
+        actions:                            # ASSUMPTION — verify key name (actions)
+          - opened
+      position: { x: 120, y: 300 }
+      paused: false
+      isCollapsed: false
+
+    # Manual-run fallback so you can demo without depending on a live webhook.
+    # Mirrors the github.onIssue payload shape (.data.issue.*).
+    - id: trigger-manual
+      name: Manual Run
+      type: TYPE_TRIGGER
+      component: start
+      configuration:
+        templates:
+          - name: sample-issue
+            payload:
+              action: opened
+              issue:
+                number: 5368
+                title: "Add markdown view mode"
+                body: "Users should be able to switch to a markdown view mode with mermaid.js diagrams and node mention chips."
+                html_url: "https://github.com/your-org/Superplane-Hackathon-/issues/5368"
+              repository:
+                full_name: "your-org/Superplane-Hackathon-"
+            parameters: []
+      position: { x: 120, y: 720 }
+      paused: false
+      isCollapsed: false
+
+    # ----- AGENT 1: write a detailed spec from the issue --------------------
+    - id: spec-writer
+      name: Claude Spec Writer
+      type: TYPE_ACTION
+      component: claude.textPrompt
+      integration:
+        id: <claude-integration-id>
+        name: ""
+      configuration:
+        model: claude-opus-4-8          # ASSUMPTION — verify config key (model)
+        maxTokens: 1500                 # ASSUMPTION — verify key (maxTokens)
+        temperature: 0
+        # Keep this in sync with factory/prompt_spec.md
+        systemMessage: |-               # ASSUMPTION — verify key (systemMessage)
+          You are the Spec Writer in an autonomous software factory. You read one
+          GitHub issue and produce a concrete, buildable implementation spec for a
+          small Node/Express web app (the repo's web/ service). Output Markdown with
+          these sections, no preamble:
+            ## Summary  ## Files to change  ## Backend changes  ## Frontend changes
+            ## Acceptance criteria  ## Out of scope
+          Be specific (file paths, endpoints, function names). Keep it shippable in
+          one PR. If the issue is vague, make reasonable, minimal assumptions and
+          state them under Summary.
+        prompt: |-                      # ASSUMPTION — verify key (prompt)
+          Issue #{{ root().data.issue.number }}: {{ root().data.issue.title }}
+
+          {{ root().data.issue.body }}
+      position: { x: 720, y: 300 }
+      paused: false
+      isCollapsed: false
+
+    # ----- GATE 1: did the spec actually get written? ----------------------
+    - id: gate-spec
+      name: "Gate: spec written?"
+      type: TYPE_ACTION
+      component: if
+      configuration:
+        # spec must be non-trivial before we spend a build on it.
+        # ASSUMPTION — verify len() exists in Expr; else check .stopReason == "end_turn".
+        expression: >-
+          {{ len($['Claude Spec Writer'].data.text) > 80 }}
+      position: { x: 1320, y: 300 }
+      paused: false
+      isCollapsed: false
+
+    # ----- POST THE SPEC back on the issue (visible proof) -----------------
+    - id: comment-spec
+      name: "GitHub: post spec"
+      type: TYPE_ACTION
+      component: github.createIssueComment
+      integration:
+        id: <github-integration-id>
+        name: ""
+      configuration:
+        repository: Superplane-Hackathon-           # ASSUMPTION — verify key
+        issueNumber: "{{ root().data.issue.number }}"  # ASSUMPTION — verify key + path
+        body: |-                                     # ASSUMPTION — verify key (body)
+          🧠 **Software Factory — spec generated by Claude**
+
+          {{ $['Claude Spec Writer'].data.text }}
+
+          ---
+          ⚙️ Building this now… a preview link will be posted on the PR shortly.
+      position: { x: 1920, y: 150 }
+      paused: false
+      isCollapsed: false
+
+    # ----- DELEGATE CODE-GEN to GitHub Actions (writes code + PR + preview) -
+    - id: run-build
+      name: "GitHub: run code-gen workflow"
+      type: TYPE_ACTION
+      component: github.runWorkflow
+      integration:
+        id: <github-integration-id>
+        name: ""
+      configuration:
+        repository: Superplane-Hackathon-   # ASSUMPTION — verify key
+        workflow: factory.yml               # ASSUMPTION — verify key (workflow file id/name)
+        ref: main                           # ASSUMPTION — verify key (ref/branch)
+        inputs:                             # ASSUMPTION — verify key (inputs map)
+          issue_number: "{{ root().data.issue.number }}"
+          issue_title: "{{ root().data.issue.title }}"
+          spec: "{{ $['Claude Spec Writer'].data.text }}"
+      position: { x: 1920, y: 450 }
+      paused: false
+      isCollapsed: false
+
+    # ----- NOTIFY: factory started -----------------------------------------
+    - id: slack-started
+      name: "Slack: factory started"
+      type: TYPE_ACTION
+      component: slack.sendTextMessage
+      integration:
+        id: <slack-integration-id>
+        name: ""
+      configuration:
+        channel: "#factory"            # ASSUMPTION — verify key + channel id form
+        text: |-                       # ASSUMPTION — verify key (text)
+          :factory: *Software Factory started* for issue #{{ root().data.issue.number }} — {{ root().data.issue.title }}
+          Claude wrote the spec; code-gen workflow dispatched. Preview link will land on the PR.
+      position: { x: 2520, y: 450 }
+      paused: false
+      isCollapsed: false
+
+    # ----- spec FAILED branch ----------------------------------------------
+    - id: slack-spec-failed
+      name: "Slack: spec failed"
+      type: TYPE_ACTION
+      component: slack.sendTextMessage
+      integration:
+        id: <slack-integration-id>
+        name: ""
+      configuration:
+        channel: "#factory"
+        text: |-
+          :warning: *Factory could not produce a usable spec* for issue #{{ root().data.issue.number }}.
+          Stopping before code-gen (Gate 1 failed). A human should refine the issue.
+      position: { x: 1920, y: 720 }
+      paused: false
+      isCollapsed: false
+
+  edges:
+    # both triggers feed the spec writer
+    - { sourceId: trigger-onissue, targetId: spec-writer, channel: default }
+    - { sourceId: trigger-manual,  targetId: spec-writer, channel: default }
+
+    # spec -> gate
+    - { sourceId: spec-writer, targetId: gate-spec, channel: default }  # ASSUMPTION — verify claude channel
+
+    # gate true -> post spec + kick off the build; gate false -> escalate
+    - { sourceId: gate-spec, targetId: comment-spec, channel: "true" }
+    - { sourceId: gate-spec, targetId: run-build,    channel: "true" }
+    - { sourceId: gate-spec, targetId: slack-spec-failed, channel: "false" }
+
+    # build dispatched -> announce
+    - { sourceId: run-build, targetId: slack-started, channel: success }  # ASSUMPTION — verify channel
